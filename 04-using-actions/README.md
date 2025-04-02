@@ -1,4 +1,4 @@
-# Using Actions in Workflows
+# Using Actions in Workflows1
 
 This GitHub Actions workflow demonstrates how to use actions within our GitHub Actions workflow to test a React application.
 
