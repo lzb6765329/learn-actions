@@ -2,7 +2,7 @@
 
 This GitHub Actions workflow demonstrates how to use actions within our GitHub Actions workflow to test a React application.
 
-## Workflow Details
+## Workflow Details1
 
 - **Trigger**: This workflow is triggered manually from the UI.
 
