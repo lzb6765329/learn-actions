@@ -251,3 +251,116 @@ signProvider:
   - 如果 CST 是必须的，请确认是否为 i.MX 设备；对于 LPC55，SPSDK 是首选。
 
 如果您提供更多细节（如具体错误或环境），我可以进一步优化指导。
+
+
+
+在使用 PyKCS11 实现签名时，验证失败通常是因为数据预处理或机制（mechanism）与 SPSDK（基于 cryptography 库）的签名逻辑不匹配。SPSDK 的 `prk.sign(data=req.data, algorithm=algorithm, prehashed=True)` 假设 `req.data` 是已哈希的值（digest），并根据密钥类型（RSA 或 ECC）和算法内部添加必要的格式化（如 DigestInfo for RSA）后签名。
+
+在 PyKCS11 的 `session.sign(priv_key, raw_bytes, mechanism)` 中，你需要手动确保 `raw_bytes` 和 `mechanism` 与 SPSDK 的行为一致。以下是针对常见密钥类型（RSA 和 ECC）的排查和修复步骤，假设 `algorithm` 是如 `hashes.SHA256()` 的哈希算法（如果你使用其他算法，需相应调整 OID 或机制）。
+
+### 1. **确认密钥类型**
+   - SPSDK 的 `prk` 是 `PrivateKeyRsa` 或 `PrivateKeyEcc` 等。
+   - 在 PyKCS11 中，使用 `session.findObjects` 或类似方法检查 `priv_key` 的属性（e.g., CKA_KEY_TYPE）以确认是 RSA (CKK_RSA) 还是 ECC (CKK_ECDSA)。
+   - 如果不确定，从 SPSDK 的上下文中获取（e.g., `prk.key_type`）。
+
+### 2. **针对 RSA 密钥**
+   - **问题原因**：SPSDK (cryptography) 在 prehashed=True 时，会将 `req.data` (hash) 包装成 DigestInfo ASN.1 结构（包含算法 OID），然后用 PKCS#1 v1.5 padding 签名。PyKCS11 的 CKM_RSA_PKCS 只对提供的 `raw_bytes` 应用 padding 和签名，如果你直接传 `req.data`（裸 hash），签名会不匹配，导致验证失败。
+   - **修复**：
+     - 使用 `mechanism = PyKCS11.CKM_RSA_PKCS`（无内置哈希）。
+     - 先构建 DigestInfo：`raw_bytes = digest_info_prefix + req.data`，其中 prefix 是算法的 ASN.1 前缀。
+     - 示例代码（使用 Python 构建 DigestInfo，支持常见哈希算法）：
+
+```python
+import PyKCS11
+
+def build_digest_info(hash_data: bytes, algorithm) -> bytes:
+    """构建 RSA PKCS#1 v1.5 的 DigestInfo ASN.1 结构"""
+    if algorithm.name == "SHA256":
+        prefix = b'\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\x04\x20'
+    elif algorithm.name == "SHA384":
+        prefix = b'\x30\x41\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x02\x05\x00\x04\x30'
+    elif algorithm.name == "SHA512":
+        prefix = b'\x30\x51\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x03\x05\x00\x04\x40'
+    elif algorithm.name == "SHA1":
+        prefix = b'\x30\x21\x30\x09\x06\x05\x2b\x0e\x03\x02\x1a\x05\x00\x04\x14'
+    else:
+        raise ValueError(f"Unsupported algorithm: {algorithm.name}")
+    
+    if len(hash_data) != algorithm.digest_size:
+        raise ValueError("Hash data length mismatch")
+    
+    return prefix + hash_data
+
+# 在你的签名代码中：
+mechanism = PyKCS11.Mechanism(PyKCS11.CKM_RSA_PKCS)
+raw_bytes = build_digest_info(req.data, algorithm)
+signature = session.sign(priv_key, raw_bytes, mechanism)
+```
+
+   - 如果 SPSDK 使用 PSS padding（e.g., `pss_padding=True`），则改用 `mechanism = PyKCS11.CKM_RSA_PKCS_PSS`，并设置机制参数（CK_RSA_PKCS_PSS_PARAMS，包括 hashAlg、mgf、sLen）。匹配 SPSDK 的 salt length（通常是 hash 长度）。
+
+### 3. **针对 ECC (ECDSA) 密钥**
+   - **问题原因**：SPSDK (cryptography) 在 prehashed=True 时，直接签名 hash，并返回 DER 编码的签名（ASN.1 SEQUENCE {r, s}）。PyKCS11 的 CKM_ECDSA 通常返回裸 r||s（大端字节，无 DER），导致格式不匹配。
+   - **修复**：
+     - 使用 `mechanism = PyKCS11.CKM_ECDSA`（无内置哈希）。
+     - `raw_bytes = req.data`（直接用 hash）。
+     - 签名后，将返回的 r||s 转换为 DER 格式，以匹配 SPSDK/cryptography 的输出。
+     - 示例代码（转换 r||s 到 DER）：
+
+```python
+import PyKCS11
+
+def ecdsa_rs_to_der(rs_bytes: bytes) -> bytes:
+    """将 ECDSA 的 r||s 转换为 DER 编码 (SEQUENCE {INTEGER r, INTEGER s})"""
+    curve_byte_len = len(rs_bytes) // 2  # e.g., 32 for P-256
+    r = rs_bytes[:curve_byte_len]
+    s = rs_bytes[curve_byte_len:]
+    
+    # 移除前导零并转换为 int
+    r_int = int.from_bytes(r, 'big')
+    s_int = int.from_bytes(s, 'big')
+    
+    # 编码 INTEGER (添加 0x00 如果 MSB 是 1 以避免负数)
+    def int_to_der(i: int) -> bytes:
+        b = i.to_bytes((i.bit_length() + 7) // 8, 'big')
+        if b[0] >= 0x80:
+            b = b'\x00' + b
+        return b'\x02' + bytes([len(b)]) + b
+    
+    r_der = int_to_der(r_int)
+    s_der = int_to_der(s_int)
+    seq = r_der + s_der
+    return b'\x30' + bytes([len(seq)]) + seq
+
+# 在你的签名代码中：
+mechanism = PyKCS11.Mechanism(PyKCS11.CKM_ECDSA)
+signature_rs = session.sign(priv_key, req.data, mechanism)  # 返回 list 或 bytes，根据 PyKCS11 版本
+if isinstance(signature_rs, list):
+    signature_rs = bytes(signature_rs)  # 如果是 list of int
+signature = ecdsa_rs_to_der(signature_rs)
+```
+
+   - 注意：曲线大小取决于密钥（e.g., P-256: 32 bytes per r/s）。如果 HSM 返回 DER，确保不重复转换。
+
+### 4. **通用排查步骤**
+   - **检查数据**：确保 `req.data` 是正确的 hash（长度匹配 `algorithm.digest_size`，e.g., 32 bytes for SHA256）。
+   - **机制匹配**：避免使用带哈希的机制如 CKM_SHA256_RSA_PKCS（这会再哈希一次 `req.data`，错误）。
+   - **验证签名**：在本地用 cryptography 库手动验证你的签名（模拟 SPSDK 的验证逻辑）：
+     ```python
+     from cryptography.hazmat.primitives.asymmetric import padding, utils
+     from cryptography.hazmat.primitives import hashes
+     
+     # 假设你有 pub_key (cryptography 的 PublicKey)
+     pub_key.verify(
+         signature,
+         req.data,
+         padding.PKCS1v15(),  # 或 PSS if applicable
+         utils.Prehashed(algorithm)
+     )
+     ```
+     如果通过，则在 SPSDK 中应正常。
+   - **错误日志**：检查 PyKCS11 的错误码（e.g., session.sign 抛出 PyKCS11Error），或 HSM 日志。
+   - **如果 PSS 或其他**：如果 SPSDK 指定 PSS，需提供更多细节（如 salt length）以设置 PSS 参数。
+   - **依赖**：确保 PyKCS11 正确加载 HSM 模块（e.g., `lib = PyKCS11.PyKCS11Lib(); lib.load('path/to/pkcs11.so')`）。
+
+如果提供更多细节（如密钥类型、algorithm 具体值、mechanism 当前值、错误消息），我可以给出更精确的代码。
