@@ -114,3 +114,63 @@ branches:
 - 如果你的仓库有多个 NuGet 包，考虑 per-project 配置或 monorepo 支持。
 
 这个设置应该完美匹配你的需求：灵活控制 NuGet 版本，只在需要时递增，而不依赖每次 main 变化。如果你有具体仓库结构或出错，分享更多细节我可以细调。
+
+以下是针对你的需求，使用 GitVersion 配置文件的示例（GitVersion.yml）。你的目标是：只在合并（merge）到 main 分支时，检查合并提交的消息是否包含 SemVer 相关的关键词（如 +semver: major/minor/patch，或者 Conventional Commits 风格如 feat:、fix: 等）来决定版本号增量。分支上的单个提交不会触发增量，只有 main 上的合并提交消息决定。
+
+GitVersion 通过设置 `commit-message-incrementing: MergeMessageOnly` 来实现只检查合并消息。同时，使用 `Mainline` 模式，确保版本计算基于 main 分支的历史，并启用 `track-merge-message: true` 来解析合并消息。
+
+### GitVersion.yml 示例配置
+```yaml
+mode: Mainline  # 使用 Mainline 模式，只考虑 main 分支上的提交历史（包括合并提交），适合 GitHub Flow 风格的工作流
+
+commit-message-incrementing: MergeMessageOnly  # 关键设置：只通过合并提交的消息来决定版本增量，忽略 PR 内单个提交的消息
+
+branches:
+  main:
+    regex: ^main$  # 匹配 main 分支
+    mode: ContinuousDeployment  # main 分支始终可部署，版本号会包含预发布标签（如 -ci.1）
+    increment: Patch  # 默认增量为 patch（如果消息无指定）
+    prevent-increment:
+      of-merged-branch: true  # 防止合并分支的自身增量影响 main（只看合并消息）
+    track-merge-target: false
+    track-merge-message: true  # 启用解析合并提交的消息
+    is-main-branch: true
+    pre-release-weight: 55000
+
+  feature:  # 对于 feature 分支，不增量版本，只作为开发分支
+    regex: ^features?[/-]
+    mode: ContinuousDeployment
+    increment: None  # 不自动增量
+    prevent-increment:
+      when-current-commit-tagged: true
+      when-branch-merged: false
+      of-merged-branch: false
+
+# 配置 SemVer 关键词解析（支持 +semver: 风格，或自定义为 Conventional Commits）
+major-version-bump-message: '(?m)^((build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\(.+\))?)(!:.+)|(^.+!:.*)|(\+semver:\s?(breaking|major))'  # major 增量：BREAKING CHANGE 或 +semver: major/breaking
+minor-version-bump-message: '(?m)^((feat)(\(.+\))?:).+|\+semver:\s?(feature|minor)'  # minor 增量：feat: 开头 或 +semver: minor/feature
+patch-version-bump-message: '(?m)^((build|chore|ci|docs|fix|perf|refactor|revert|style|test)(\(.+\))?:).+|\+semver:\s?(fix|patch)'  # patch 增量：fix: 等 或 +semver: patch/fix
+no-bump-message: '\+semver:\s?(none|skip)'  # 跳过增量：+semver: none/skip
+
+ignore:
+  sha: []  # 如果需要忽略某些提交 SHA，可以在这里添加
+```
+
+### 解释
+- **mode: Mainline**：版本计算只基于 main 分支的提交历史。合并提交会被视为 main 上的关键点，不会遍历分支上的所有单个提交。
+- **commit-message-incrementing: MergeMessageOnly**：这是核心，确保只检查合并提交的消息（例如 PR 合并时的消息）。如果合并消息包含 SemVer 关键词，才会增量版本；否则保持不变。
+- **track-merge-message: true**：在 main 分支上启用解析合并消息。
+- **prevent-increment of-merged-branch: true**：防止被合并的分支（如 feature）的提交影响版本，只依赖合并消息。
+- **SemVer 关键词配置**：我配置了支持 Conventional Commits（Angular 风格，如 `feat: add new feature` 增 minor，`fix: bug fix` 增 patch，`BREAKING CHANGE:` 或 `feat!: ` 增 major）。同时兼容 +semver: 风格。如果你只想用 +semver:，可以简化 regex 只保留 +semver 部分。
+- **其他分支**：feature 分支设置为不增量（increment: None），确保开发时版本稳定，只有合并到 main 后才可能变化。
+
+### 使用建议
+1. 将此 GitVersion.yml 放在仓库根目录。
+2. 在 PR 合并时，确保合并消息包含关键词，例如：
+   - "Merge pull request #123: feat: add new API" → 增 minor。
+   - "Merge branch 'fix/bug': +semver: patch" → 增 patch。
+   - 如果无关键词或有 +semver: skip → 不增量。
+3. 测试：运行 `gitversion /showvariable FullSemVer` 查看计算的版本。
+4. 如果你的工作流是 GitHub Flow（feature PR 到 main），这很合适。如果需要调整 regex 或其他，参考 GitVersion 官方文档。
+
+如果实际运行有问题，可以提供更多仓库细节，我再帮调。
